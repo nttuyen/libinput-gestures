@@ -2,6 +2,7 @@
 'Read gestures from libinput touchpad and action shell commands.'
 # Mark Blakeney, Sep 2015
 import os, sys, argparse, subprocess, shlex, re, getpass, fcntl, platform, math
+import json
 from collections import OrderedDict
 from pathlib import Path
 from distutils.version import LooseVersion as Version
@@ -10,7 +11,7 @@ PROG = Path(sys.argv[0]).stem
 
 # Conf file containing gesture commands.
 # Search first for user file then system file.
-CONFNAME = '{}.conf'.format(PROG)
+CONFNAME = '{}.json'.format(PROG)
 USERDIR = os.getenv('XDG_CONFIG_DIR', os.path.expanduser('~/.config'))
 CONFDIRS = (USERDIR, '/etc')
 
@@ -56,6 +57,22 @@ def open_lock(*args):
         return None
 
     return fp
+
+
+def get_current_app():
+   Gtk.init([])
+   while Gtk.events_pending():
+     Gtk.main_iteration()
+   screen = Wnck.Screen.get_default()
+   screen.force_update()
+   window = screen.get_active_window()
+   app_name = window.get_application().get_name()
+   print(window.get_application().get_windows())
+   pid = window.get_pid()
+   #with open("/proc/{pid}/cmdline".format(pid=pid)) as f:
+   #    app_name = f.read()
+   return app_name
+
 
 def run(cmd, check=True):
     'Run subprocess function and return standard output or None'
@@ -222,6 +239,102 @@ class COMMAND_internal(COMMAND):
         if index >= minindex and index < maxindex:
             run(('wmctrl', '-s', str(index)))
 
+
+##Actions
+class Action:
+    """This class to wrap data of action"""
+    def __init__(self, gesture, motion, fingers, apps, command, finish_command):
+        self.gesture = gesture
+        self.motion = motion
+        self.fingers = fingers
+        self.apps = apps
+        self.command = command
+        self.finish_command = finish_command
+        self.sub_actions = []
+        self.running = False
+
+    def match(self, gesture, motion, fingers, app):
+        if self.gesture != gesture:
+            return False
+        if self.motion != motion:
+            return False
+
+        if self.fingers and self.fingers != fingers:
+            return False
+
+        if app is not None and len(self.apps) > 0:
+            notFound = True
+            for a in self.apps:
+                if a not in app:
+                    continue
+                else:
+                    notFound = False
+                    break
+            if notFound:
+                return False
+        return True
+
+    def add(self, action):
+        if len(self.sub_actions) > 0:
+            return None
+        self.sub_actions.append(action)
+        return None
+
+    def find_sub_action(self, gesture, motion, fingers):
+        return None
+
+    def execute(self, gesture, motion, fingers):
+        if self.running:
+            if self.match(gesture, motion, fingers, None):
+                self.finish_command.run()
+                return True
+            else:
+                sub = self.find_sub_action(gesture, motion, fingers)
+                if sub:
+                    sub.execute(gesture, motion, fingers)
+                return False
+        else:
+            self.command.run()
+            if self.finish_command is None:
+                return True
+            elif len(self.sub_actions) == 0:
+                self.finish_command.run()
+                return True
+            else:
+                return False
+        return False
+
+
+
+class ActionExecutor:
+    def __init__(self):
+        self.actions = []
+        self.current_action = None
+
+    def add(self, action):
+        self.actions.append(action)
+        return None
+
+    def find_action(self, gesture, motion, fingers, app):
+        for action in self.actions:
+            if action.match(gesture, motion, fingers, app):
+                return action
+        return None
+
+    def execute(self, gesture, motion, fingers, app):
+        if self.current_action is None:
+            self.current_action = self.find_action(gesture, motion, fingers, app)
+
+        if self.current_action is not None:
+            remove = self.current_action.execute(gesture, motion, fingers)
+            if remove:
+                self.current_action = None
+
+
+actionExecutor = ActionExecutor()
+
+
+
 # Table of gesture handlers
 handlers = OrderedDict()
 
@@ -236,6 +349,15 @@ class GESTURE:
         self.name = type(self).__name__
         self.motions = OrderedDict()
         self.has_extended = False
+
+    def is_support(self, motion):
+        'Check if a motion is supported or not'
+        if motion not in self.SUPPORTED_MOTIONS:
+            return False
+        else:
+            if self.extended_text in motion:
+                self.has_extended = True
+            return True
 
     def add(self, motion, fingers, command):
         'Add a configured motion command for this gesture'
@@ -264,6 +386,10 @@ class GESTURE:
 
     def action(self, motion):
         'Action a motion command for this gesture'
+
+        app_name = get_current_app()
+        print('App name is {}', app_name)
+
         command = self.motions.get((motion, self.fingers)) or \
                 self.motions.get(motion)
 
@@ -290,6 +416,10 @@ class SWIPE(GESTURE):
 
     def end(self):
         'Action this gesture at the end of a motion sequence'
+
+        app_name = get_current_app()
+        print('App name {}', app_name)
+
         x, y = self.data
         abx = abs(x)
         aby = abs(y)
@@ -389,16 +519,21 @@ def get_conf_line(line):
 
 def get_conf(conffile, confname):
     'Read given configuration file and store internal actions etc'
-    with conffile.open() as fp:
-        for num, line in enumerate(fp, 1):
-            line = line.strip()
-            if not line or line[0] == '#':
-                continue
+    # with conffile.open() as fp:
+    #     for num, line in enumerate(fp, 1):
+    #         line = line.strip()
+    #         if not line or line[0] == '#':
+    #             continue
 
-            errmsg = get_conf_line(line)
-            if errmsg:
-                sys.exit('Error at line {} in file {}:\n>> {} <<\n{}.'.format(
-                    num, confname, line, errmsg))
+    #         errmsg = get_conf_line(line)
+    #         if errmsg:
+    #             sys.exit('Error at line {} in file {}:\n>> {} <<\n{}.'.format(
+    #                 num, confname, line, errmsg))
+    print(conffile)
+    with open(str(conffile), 'r') as f:
+        config = json.load(f)
+        print(config)
+
 
 def unexpanduser(cfile):
     'Return absolute path name, with $HOME replaced by ~'
